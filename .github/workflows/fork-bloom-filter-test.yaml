@@ -1,0 +1,116 @@
+# Fork-only pre-validation for scylladb/scylladb#31207. NOT part of the PR.
+#
+# Where it goes: .github/workflows/fork-bloom-filter-test.yaml on the DEFAULT branch of
+# sankalpsthakur/scylladb (GitHub only offers workflow_dispatch for workflows on the default
+# branch). Never commit it to fix/31207-bloom-fp-chance-seal. Note: pushing to the fork's
+# master also fires three upstream push workflows (call_backport_with_jira,
+# differential-shellcheck, conflict_reminder); they are cheap and do not touch the PR.
+#
+# Run: Actions tab -> "fork bloom_filter_test (#31207)" -> Run workflow, or
+#   gh workflow run fork-bloom-filter-test.yaml -R sankalpsthakur/scylladb -f ref=fix/31207-bloom-fp-chance-seal
+#
+# What it does: copies read-toolchain.yaml + build-scylla.yaml (frozen toolchain container,
+# ./configure.py, ninja), but builds only build/dev/test/boost/bloom_filter_test. With the fix it
+# runs the new case once directly, 100 times via test.py (per .github/copilot-instructions.md),
+# and the whole file once. Then it restores the pre-fix sstables/sstables.cc (HEAD~1, so the
+# fix must be the tip commit of `ref`), rebuilds incrementally, and requires the new case to
+# FAIL with the original exception. That gives fail-before/pass-after evidence for the PR.
+#
+# Expected runtime on ubuntu-latest (4 vCPU, 16 GB): roughly 75-120 min, nearly all of it the
+# first dev build (the upstream nightly seastar.yaml needs ~60-75 min for `scylla` alone).
+# Unproven risks: runner disk (dev objects + the toolchain image) and test.py inside a container.
+# -j is capped at nproc to lower OOM risk.
+name: "fork bloom_filter_test (#31207)"
+
+# Fork-only: runs on push to this CI branch and tests REF (the PR branch, whose tip is the fix).
+on:
+  push:
+    branches:
+      - ci/31207-fork-validate
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  REF: fix/31207-bloom-fp-chance-seal
+  MODE: dev
+  TEST_CASE: test_bloom_filter_fp_chance_near_minimum
+  # Same arguments test.py uses for this test: test/pylib/cpp/base.py DEFAULT_SCYLLA_ARGS,
+  # test/boost/test_config.yaml custom_args (-c1) and extra_scylla_cmdline_options.
+  SEASTAR_ARGS: >-
+    --overprovisioned --unsafe-bypass-fsync=1 --kernel-page-cache=1
+    --blocked-reactor-notify-ms=2000000 --max-networking-io-control-blocks=1000
+    -c1 --reactor-backend=linux-aio
+
+jobs:
+  # Same as .github/workflows/read-toolchain.yaml, but reads the image of the tested ref.
+  read-toolchain:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.read.outputs.image }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.REF }}
+          sparse-checkout: tools/toolchain/image
+          sparse-checkout-cone-mode: false
+      - id: read
+        run: |
+          image=$(cat tools/toolchain/image)
+          echo "image=$image" >> $GITHUB_OUTPUT
+
+  bloom-filter-test:
+    needs:
+      - read-toolchain
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container: ${{ needs.read-toolchain.outputs.image }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.REF }}
+          fetch-depth: 2
+          submodules: recursive
+      - name: Generate the building system
+        run: |
+          git config --global --add safe.directory '*'
+          git log -2 --format='%h %s'
+          ./configure.py --mode $MODE
+      - name: Build bloom_filter_test (with the fix)
+        run: |
+          ninja -j $(nproc) build/$MODE/test/boost/bloom_filter_test
+      - name: Run the new case once, directly (with the fix, must pass)
+        run: |
+          build/$MODE/test/boost/bloom_filter_test --catch_system_errors=no --color_output=false \
+            --run_test=$TEST_CASE -- $SEASTAR_ARGS
+      - name: Run the new case 100 times via test.py (with the fix, must pass)
+        run: |
+          ./test.py --mode=$MODE --no-gather-metrics --repeat 100 --max-failures 1 \
+            test/boost/bloom_filter_test.cc::$TEST_CASE
+      - name: Run the whole bloom_filter_test file via test.py (with the fix, must pass)
+        run: |
+          ./test.py --mode=$MODE --no-gather-metrics test/boost/bloom_filter_test.cc
+      - name: Restore the pre-fix sstables/sstables.cc and rebuild (incremental)
+        run: |
+          git checkout HEAD~1 -- sstables/sstables.cc
+          git status --short
+          ninja -j $(nproc) build/$MODE/test/boost/bloom_filter_test
+      - name: Run the new case without the fix (must fail with the original exception)
+        run: |
+          set +e
+          build/$MODE/test/boost/bloom_filter_test --catch_system_errors=no --color_output=false \
+            --run_test=$TEST_CASE -- $SEASTAR_ARGS > prefix.log 2>&1
+          rc=$?
+          set -e
+          cat prefix.log
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::the new test passed without the fix"
+            exit 1
+          fi
+          if ! grep -q "Unable to satisfy" prefix.log; then
+            echo "::error::the new test failed without the fix, but not with unsupported_operation_exception"
+            exit 1
+          fi
+          echo "Without the fix the new test fails with the expected exception (rc=$rc)."
