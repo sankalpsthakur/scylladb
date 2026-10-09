@@ -94,13 +94,18 @@ jobs:
         run: |
           build/$MODE/test/boost/bloom_filter_test --catch_system_errors=no --color_output=false \
             --run_test=$TEST_CASE -- $SEASTAR_ARGS
-      - name: Run the new case 100 times via test.py (with the fix, must pass)
+      # test.py starts dockerized 3rd-party services (S3 mock) at session start, which fails inside
+      # this container (no docker), so run the boost binary directly.
+      - name: Run the new case 100 times directly (with the fix, must pass)
         run: |
-          ./test.py --mode=$MODE --no-gather-metrics --repeat 100 --max-failures 1 \
-            test/boost/bloom_filter_test.cc::$TEST_CASE
-      - name: Run the whole bloom_filter_test file via test.py (with the fix, must pass)
+          for i in $(seq 1 100); do
+            build/$MODE/test/boost/bloom_filter_test --catch_system_errors=no --color_output=false \
+              --run_test=$TEST_CASE -- $SEASTAR_ARGS > run.log 2>&1 || { echo "run $i failed"; cat run.log; exit 1; }
+          done
+          echo "100/100 runs passed"
+      - name: Run the whole bloom_filter_test binary directly (with the fix, must pass)
         run: |
-          ./test.py --mode=$MODE --no-gather-metrics test/boost/bloom_filter_test.cc
+          build/$MODE/test/boost/bloom_filter_test --catch_system_errors=no --color_output=false -- $SEASTAR_ARGS
       - name: Restore the pre-fix sstables/sstables.cc and rebuild (incremental)
         run: |
           git checkout HEAD~1 -- sstables/sstables.cc
