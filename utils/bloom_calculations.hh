@@ -84,7 +84,7 @@ namespace bloom_calculations {
 
         // Handle the trivial cases
         if(max_false_pos_prob >= probs[min_buckets][min_k]) {
-            return bloom_specification(2, opt_k_per_buckets[2]);
+            return bloom_specification(opt_k_per_buckets[2], 2);
         }
 
         if (max_false_pos_prob < probs[max_buckets_per_element][max_k]) {

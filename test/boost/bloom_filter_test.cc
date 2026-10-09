@@ -17,6 +17,7 @@
 
 #include "db/config.hh"
 #include "readers/from_mutations.hh"
+#include "utils/bloom_calculations.hh"
 #include "utils/bloom_filter.hh"
 #include "utils/error_injection.hh"
 #include "utils/i_filter.hh"
@@ -584,4 +585,24 @@ SEASTAR_TEST_CASE(test_rebuild_from_temporary_hashes) {
             BOOST_REQUIRE(sst_temporary_hashes->filter_has_key(sstables::key::from_partition_key(*s, dk._key)));
         }
     });
+}
+
+// Reproducer for https://github.com/scylladb/scylladb/issues/31204.
+// compute_bloom_spec() treats a false positive rate of at least probs[min_buckets][min_k]
+// (0.393) as a trivial case and returns the cheapest spec in the table: 2 buckets per
+// element, with the optimal K for 2 buckets. It used to swap K and the bucket count,
+// returning K=2 with 1 bucket per element, whose false positive rate is about 0.75.
+SEASTAR_TEST_CASE(test_compute_bloom_spec_for_high_fp_chance) {
+    using namespace utils::bloom_calculations;
+    const int max_buckets = int(probs.size()) - 1;
+    for (const double fp_chance : {probs[min_buckets][min_k], 0.4, 0.5, 0.74, 0.9}) {
+        const auto spec = compute_bloom_spec(max_buckets, fp_chance);
+        BOOST_REQUIRE_MESSAGE(spec.K == opt_k_per_buckets[2] && spec.buckets_per_element == 2,
+                fmt::format("compute_bloom_spec({}, {}) = (K={}, buckets_per_element={}), expected (K={}, buckets_per_element=2)",
+                        max_buckets, fp_chance, spec.K, spec.buckets_per_element, opt_k_per_buckets[2]));
+        // The spec has to meet the requested rate. probs is indexed by the spec,
+        // so this has to come after the check above.
+        BOOST_REQUIRE_LE(probs[spec.buckets_per_element][spec.K], fp_chance);
+    }
+    return make_ready_future<>();
 }
