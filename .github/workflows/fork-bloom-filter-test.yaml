@@ -72,7 +72,16 @@ jobs:
         with:
           ref: ${{ env.REF }}
           fetch-depth: 2
-          submodules: recursive
+          submodules: false
+      # .gitmodules uses relative URLs (../seastar, ../abseil-cpp, ...), which resolve to the fork's
+      # owner and do not exist there. Point them back at the scylladb org.
+      - name: Fetch submodules from the scylladb org
+        run: |
+          git config --global --add safe.directory '*'
+          git config --global url."https://github.com/scylladb/".insteadOf "https://github.com/${{ github.repository_owner }}/"
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth=1 --jobs 4
+          git submodule status --recursive
       - name: Generate the building system
         run: |
           git config --global --add safe.directory '*'
